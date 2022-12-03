@@ -167,6 +167,8 @@ try{
 
 如果成员自定义了其operator new, 则在使用new表达式时, 会调用该成员内部的operator new
 
+如果想显式使用全局new, 则写法是`Complex *pc = ::new Complex`
+
 也就是说, 在上述try包围的三条语句中, 重载operator new只会影响第一句
 
 
@@ -476,7 +478,7 @@ try{
 
 **而且, 对于new 和 重载版本的new, 其后必须跟一个对象, 因为编译器会执行sizeof(Complex)操作, 如果没有对象, 则参数不全. 这也就注定了, 在任何时候使用new, 都会有对象构造的操作**
 
-## 12
+## 12 13 per-class allocator
 
 针对一个class写出其自己的内存管理函数
 
@@ -485,6 +487,7 @@ try{
 除了减少`malloc`的调用次数, 作为类的设计者, 我们总想减小`cookie`的用量, 因为一次`malloc`就会产生一些`cookie` (空间角度). 
 
 ```c++
+// Screen.cpp
 #include <cstddef>
 #include <iostream>
 
@@ -500,10 +503,11 @@ public:
         // 你可能会问: 你都没有构造Screen对象, 为什么能访问其next成员变量?
         // 答: 我们访问的是某个地址, 和该地址是否被构造对象无关, 即freeStore->next == *(Screen *)(freeStore + 4)
         // 新的问题: 你在未构造对象时就设置其所在内存的next成员变量, 当你构造Screen对象的时候, next会不会被初始化从而改变了其在内存中的值?
+        // 新的答案: 在构造函数中, 没有指明如何初始化next, 则next会被执行默认初始化
         if(!freeStore)
         {
             freeStore = reinterpret_cast<Screen *>(new char[size * screenChunk]);
-            for(p = freeStore; p != freeStore[screenChunk - 1]; ++p)
+            for(p = freeStore; p != &freeStore[screenChunk - 1]; ++p)
                 p->next = p + 1;
             p->next = nullptr;
         }
@@ -512,7 +516,13 @@ public:
         return p;
     }
     
-    void operator delete(size_)
+    void operator delete(void *block, size_t size)
+    {
+        Screen *deadObj = (Screen *)block;
+        deadObj->~Screen();
+        deadObj->next = freeStore;  // 回收到freeStore的头部
+        freeStore = deadObj;
+    }
 private:
     static Screen *freeStore;		// freeStore指向当前池中可用的第一个对象
     static const int screenChunk;	// 内存池中预分配对象的个数
@@ -523,7 +533,185 @@ private:
 
 // 一般不在头文件中初始化类的静态成员变量, 否则会重定义
 // 一般在一个且仅一个CPP文件文件中初始化类的静态成员变量, 初始化时不允许写static关键字
-const int Screen:screenChunk = 24;
-Screen Screen::freeStore = nullptr;
+const int Screen::screenChunk = 24;
+Screen *Screen::freeStore = nullptr;
+```
+
+**构造函数默认初始化的验证**
+
+**默认初始化, 对于非全局和非静态native变量来说, 就是默认内存中的原生值(垃圾值); 对于类变量, 执行默认初始化**
+
+```c++
+// default_initialized.cpp
+class Foo
+{
+public:
+    Foo(char ch2, char ch4) : c2(ch2), c4(ch4) {}   // c1 和 c3 执行 default initialized
+    char c1, c2, c3, c4;
+
+};
+
+int main()
+{
+    char *p = (char *)malloc(12);
+    p[0] = 0;
+    strncat(p, "Hello World", 11);
+    cout << p << endl;	// Hello World
+
+    Foo *q = (Foo *)p;
+    q = new(q)Foo('2','4');
+    cout << q->c1 << q->c2 << q->c3 << q->c4 << endl;   // ouput: H2l4, 证明了默认初始化
+}
+```
+
+上述的版本每一个Screen中都存储一个next指针, 代价高昂
+
+我们可以使用union来实现embedded pointer. 在union中, 对象不被使用时, 表示的是next指针; 对象正在被使用时, 表示的是成员变量的数据
+
+```c++
+// <AirPlane.cpp>
+#include <iostream>
+#include <new>
+
+class AirPlane
+{
+private:
+    struct AirPlaneRep          // Rep = Representation
+    {
+        unsigned long miles;
+        char type;
+    };
+    union                       // anonymous union
+    {
+        AirPlaneRep rep;
+        AirPlane *next;
+    };
+
+public:
+    void set(unsigned long m, char c) { rep.miles = m; rep.type = c; }
+    unsigned long getMiles() { return rep.miles; }
+    char getType() { return rep.type; }
+
+private:
+    static const int BLOCK_SIZE;
+    static AirPlane *headOfFreeList;
+
+public:
+    static void *operator new(size_t size)
+    {
+        if(size != sizeof(AirPlane)) return ::operator new(size);   // 继承
+
+        AirPlane *p = nullptr;
+        if(headOfFreeList == nullptr)
+        {
+            headOfFreeList = static_cast<AirPlane*>(::operator new(size * BLOCK_SIZE));
+            for(int i = 0; i < BLOCK_SIZE - 1; i++)
+                headOfFreeList[i].next = headOfFreeList + i + 1;
+            headOfFreeList[BLOCK_SIZE - 1].next = nullptr; 
+        }
+        p = headOfFreeList;
+        headOfFreeList = headOfFreeList->next;
+        return p;
+    }
+    static void operator delete(void *block, size_t size)
+    {
+        if(block == nullptr) return;
+        if(size != sizeof(AirPlane))	// 继承
+        {
+            ::operator delete(block);
+            return;
+        }
+        AirPlane *deadObj = static_cast<AirPlane*>(block);
+        deadObj->~AirPlane();
+        deadObj->next = headOfFreeList;
+        headOfFreeList = deadObj;
+    }
+};
+
+// initialize static member data
+const int AirPlane::BLOCK_SIZE = 512;
+AirPlane *AirPlane::headOfFreeList = nullptr;
+```
+
+上述两个类自己的构造器是这样工作的: 当用户需要new对象时, 类一次性分配出N个对象所占内存, 依次分发给用户; 当用户用完了N个内存时, freeStore会指向空, 这时用户需要new对象, 类又会一次性分配出N个对象所占内存; 然后用户释放了所有的对象, 这时候freeStore的链表中有2N个对象空间. 这2N个对象虽然没有还给系统, 但是不是内存泄漏, 因为还在freeStore手上.
+
+freeStore是静态成员, 每次分配回收都是操作的一个变量, 会不会有线程安全问题?
+
+## 14 static allocator
+
+上述两个类的分配器非常相似, 在很多情况下, 我们对内存管理的写法都是这样的. 那么从软件工程的角度, 能不能把该功能抽取出来呢? 从而避免写很多重复代码. 为此, 我们设计一个类`allocator`, 提供两个方法`allocate(size_t), deallocate(void *, size_t)` .
+
+```c++
+class allocator
+{
+private:
+    struct linker { linker *next; };  // embedded pointer
+    linker *freeStore = nullptr;      // head of freelist
+    int chunk = 5;                    // default block size
+public:
+    void setChunk(int x) { chunk = x; }
+    void *allocate(size_t size)
+    {
+        linker *p = nullptr;
+        if(freeStore == nullptr)
+        {
+            p = freeStore = (linker *)malloc(size * chunk);
+            for(int i = 0; i < chunk - 1; i++)
+            {
+                p->next = (linker *)((char *)p + size);
+                p = p->next;
+            }
+            p->next = nullptr; 
+        }
+        p = freeStore;
+        freeStore = freeStore->next;
+        return p;
+    }
+    void deallocate(void *block, size_t size)
+    {
+        if(block == nullptr) return;
+        linker *p = (linker *)block;
+        p->next = freeStore;
+        freeStore = p;
+    }
+};
+```
+
+其他程序想使用allocator的内存管理时, 直接在其类中引入一个allocator静态对象即可, 然后将其new和delete操作全部交给allocator处理即可. 就像下面这样.
+
+```c++
+#include "static_allocator.h"
+
+class Foo
+{
+private:
+    int x, y;   // 值得注意的是, 对象占用的空间必须比next指针大;
+                // 在64位环境下执行, 指针占用8个字节, int只占用4个字节, 所以如果只有一个变量x, 则出错
+public:
+    static allocator alloc;
+    static void *operator new(size_t size) 
+    { return alloc.allocate(size); }
+    static void operator delete(void *block, size_t size) 
+    { return alloc.deallocate(block, size); }
+};
+
+// initialize static member data
+allocator Foo::alloc;
+```
+
+如下是测试程序
+
+```c++
+int main()
+{
+    int N = 12;
+    Foo *p[N];
+    Foo::alloc.setChunk(10);
+    for(int i = 0; i < N; i++)  
+    {
+        p[i] = new Foo;
+        cout << p[i] << endl;   // 输出的前十个地址是连续的, 后续就不连续了
+    }
+}
 ```
 
