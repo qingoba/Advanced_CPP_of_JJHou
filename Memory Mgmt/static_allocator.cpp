@@ -13,20 +13,42 @@ public:
     { return alloc.deallocate(block, size); }
 };
 
+class Goo
+{
+private:
+    int x, y;
+    DECLARE_POOL_ALLOC;
+};
+
 // initialize static member data
 allocator Foo::alloc;
+IMPLEMENT_POOL_ALLOC(Goo);
 
 using std::cout;
 using std::endl;
 
-int main()
+template <class T>
+void test_static_allocator()
 {
     int N = 12;
-    Foo *p[N];
-    Foo::alloc.setChunk(10);
+    T *p[N];
+    // T::alloc.setChunk(10);
     for(int i = 0; i < N; i++)  
     {
-        p[i] = new Foo;
-        cout << p[i] << endl;   // 输出的前十个地址是连续的, 后续就不连续了
+        p[i] = new T;
+        cout << p[i] << endl;   // 输出的前5个地址是连续的, 后续就不连续了
     }
+    for(int i = 0; i < N; i++) delete p[i];
+    for(int i = 0; i < N; i++)
+    {
+        p[i] = new T;
+        cout << p[i] << endl;   // 倒序复用上面的地址
+    }
+}
+
+int main()
+{
+    test_static_allocator<Foo>();
+    cout << endl;
+    test_static_allocator<Goo>();
 }

@@ -303,79 +303,48 @@ typedef malloc_alloc single_client_alloc;
 // creation of multiple default_alloc instances.
 // Node that containers built on different allocator instances have
 // different types, limiting the utility of this approach.
-#ifdef __SUNPRO_CC
-// breaks if we make these template class members:
-  enum {__ALIGN = 8};
-  enum {__MAX_BYTES = 128};
-  enum {__NFREELISTS = __MAX_BYTES/__ALIGN};
-#endif
-
+// 1. 该实现中有一些对__SUNPRO_CC宏特定的处理, 为了简洁已被我删去
+//    SUNPRO_CC应该是某种编译器
+// 2. 该实现中考虑了线程安全问题, 其中有三种线程: SGI_THREAD, PTHREAD, WIN32THREAD
+//    我只保留了PTHREAD的一部分, 并删去了条件编译
+// 3. volatile是什么意思?
 template <bool threads, int inst>
-class __default_alloc_template {
-
+class __default_alloc_template  
+{
 private:
-  // Really we should use static const int x = N
-  // instead of enum { x = N }, but few compilers accept the former.
-# ifndef __SUNPRO_CC
-    enum {__ALIGN = 8};
-    enum {__MAX_BYTES = 128};
-    enum {__NFREELISTS = __MAX_BYTES/__ALIGN};
-# endif
-  static size_t ROUND_UP(size_t bytes) {
+    static const int = __ALIGN = 8;
+    static const int = __MAX_BYTES = 128;
+    static const int = __NFREELISTS = __MAX_BYTES/__ALIGN;
+    static size_t ROUND_UP(size_t bytes)  
+    {
+        // 将传入的bytes向上调整至8字节对齐
+        // ~7 == 11...111000, 将一个数与~7相与会丢失末尾三位, 前面的不变
+        // 因为是向上调整, 为了防止相与之后数值变小, 先让其加7!
+        // 这样做: 当传入是8字节倍数时, 数值不变; 不是8字节倍数时, 向上调整到最近的8字节倍数
         return (((bytes) + __ALIGN-1) & ~(__ALIGN - 1));
-  }
-__PRIVATE:
-  union obj {
-        union obj * free_list_link;
-        char client_data[1];    /* The client sees this.        */
-  };
-private:
-# ifdef __SUNPRO_CC
-    static obj * __VOLATILE free_list[]; 
-        // Specifying a size results in duplicate def for 4.1
-# else
-    static obj * __VOLATILE free_list[__NFREELISTS]; 
-# endif
-  static  size_t FREELIST_INDEX(size_t bytes) {
-        return (((bytes) + __ALIGN-1)/__ALIGN - 1);
-  }
-
-  // Returns an object of size n, and optionally adds to size n free list.
-  static void *refill(size_t n);
-  // Allocates a chunk for nobjs of size "size".  nobjs may be reduced
-  // if it is inconvenient to allocate the requested number.
-  static char *chunk_alloc(size_t size, int &nobjs);
-
-  // Chunk allocation state.
-  static char *start_free;
-  static char *end_free;
-  static size_t heap_size;
-
-# ifdef __STL_SGI_THREADS
-    static volatile unsigned long __node_allocator_lock;
-    static void __lock(volatile unsigned long *); 
-    static inline void __unlock(volatile unsigned long *);
-# endif
-
-# ifdef __STL_PTHREADS
-    static pthread_mutex_t __node_allocator_lock;
-# endif
-
-# ifdef __STL_WIN32THREADS
-    static CRITICAL_SECTION __node_allocator_lock;
-    static bool __node_allocator_lock_initialized;
-
-  public:
-    __default_alloc_template() {
-	// This assumes the first constructor is called before threads
-	// are started.
-        if (!__node_allocator_lock_initialized) {
-            InitializeCriticalSection(&__node_allocator_lock);
-            __node_allocator_lock_initialized = true;
-        }
     }
-  private:
-# endif
+    struct obj { obj * next; }
+    static obj * __VOLATILE free_list[__NFREELISTS]; 
+    static size_t FREELIST_INDEX(size_t bytes) 
+    {
+        // 返回bytes应该被存放的链表
+        // 因为是向上调整, 所以+7之后除以8
+        // 因为freeLiLst下标从0开始, 所以-1
+        return (((bytes) + __ALIGN-1)/__ALIGN - 1);
+    }
+
+    // Returns an object of size n, and optionally adds to size n free list.
+    static void *refill(size_t n);  // 充值
+    // Allocates a chunk for n-objs of size "size".  nobjs may be reduced
+    // if it is inconvenient to allocate the requested number.
+    static char *chunk_alloc(size_t size, int &nobjs);  // chunk表示大块, block表示小块
+
+    // Chunk allocation state.
+    static char *start_free;    // 指向当前可用内存池pool的起始
+    static char *end_free;      // 指向战备池pool的尾后
+    static size_t heap_size;    // 累计分配量 (一共拿到了多少内存)
+
+    static pthread_mutex_t __node_allocator_lock;
 
     class lock {
         public:
@@ -387,14 +356,14 @@ private:
 public:
 
   /* n must be > 0      */
+  // 分配n个字节的空间
   static void * allocate(size_t n)
   {
     obj * __VOLATILE * my_free_list;
     obj * __RESTRICT result;
 
-    if (n > (size_t) __MAX_BYTES) {
-        return(malloc_alloc::allocate(n));
-    }
+    if (n > (size_t) __MAX_BYTES)  return(malloc_alloc::allocate(n));
+
     my_free_list = free_list + FREELIST_INDEX(n);
     // Acquire the lock here with a constructor call.
     // This ensures that it is released in exit or during stack
@@ -403,18 +372,21 @@ public:
         /*REFERENCED*/
         lock lock_instance;
 #       endif
-    result = *my_free_list;
+    result = *my_free_list;  // result表示我们要操作的那个链表
     if (result == 0) {
         void *r = refill(ROUND_UP(n));
         return r;
     }
-    *my_free_list = result -> free_list_link;
+    *my_free_list = result -> next;
     return (result);
   };
 
   /* p may not be 0 */
   static void deallocate(void *p, size_t n)
   {
+    // 该回收器有两点缺陷
+    // 1. 回收内存后不还给OS, 一直占据手中, 每个进程都有自己的全局std::allocator
+    // 2. 没有对指针p进行检查
     obj *q = (obj *)p;
     obj * __VOLATILE * my_free_list;
 
@@ -428,7 +400,7 @@ public:
         /*REFERENCED*/
         lock lock_instance;
 #       endif /* _NOTHREADS */
-    q -> free_list_link = *my_free_list;
+    q -> next = *my_free_list;
     *my_free_list = q;
     // lock is released here
   }
@@ -454,11 +426,15 @@ __default_alloc_template<threads, inst>::chunk_alloc(size_t size, int& nobjs)
     size_t total_bytes = size * nobjs;
     size_t bytes_left = end_free - start_free;
 
-    if (bytes_left >= total_bytes) {
+    if (bytes_left >= total_bytes) 
+    {
+        // 够n-objs个
         result = start_free;
         start_free += total_bytes;
         return(result);
-    } else if (bytes_left >= size) {
+    } else if (bytes_left >= size) 
+    {
+        // 够至少一个
         nobjs = bytes_left/size;
         total_bytes = size * nobjs;
         result = start_free;
@@ -467,12 +443,14 @@ __default_alloc_template<threads, inst>::chunk_alloc(size_t size, int& nobjs)
     } else {
         size_t bytes_to_get = 2 * total_bytes + ROUND_UP(heap_size >> 4);
         // Try to make use of the left-over piece.
-        if (bytes_left > 0) {
+        if (bytes_left > 0) 
+        {
             obj * __VOLATILE * my_free_list =
                         free_list + FREELIST_INDEX(bytes_left);
 
-            ((obj *)start_free) -> free_list_link = *my_free_list;
+            ((obj *)start_free) -> next = *my_free_list;
             *my_free_list = (obj *)start_free;
+            // 此时start和end之间已经没有任何元素, start和end指针也无意义的
         }
         start_free = (char *)malloc(bytes_to_get);
         if (0 == start_free) {
@@ -485,10 +463,10 @@ __default_alloc_template<threads, inst>::chunk_alloc(size_t size, int& nobjs)
                 my_free_list = free_list + FREELIST_INDEX(i);
                 p = *my_free_list;
                 if (0 != p) {
-                    *my_free_list = p -> free_list_link;
+                    *my_free_list = p -> next;
                     start_free = (char *)p;
                     end_free = start_free + i;
-                    return(chunk_alloc(size, nobjs));
+                    return(chunk_alloc(size, nobjs));   // 直接递归调用, 写法太神了!!
                     // Any leftover piece will eventually make it to the
                     // right free list.
                 }
@@ -501,7 +479,7 @@ __default_alloc_template<threads, inst>::chunk_alloc(size_t size, int& nobjs)
         }
         heap_size += bytes_to_get;
         end_free = start_free + bytes_to_get;
-        return(chunk_alloc(size, nobjs));
+        return(chunk_alloc(size, nobjs));   // 递归调用自己, 这种写法真的是神了!!!
     }
 }
 
@@ -513,7 +491,7 @@ template <bool threads, int inst>
 void* __default_alloc_template<threads, inst>::refill(size_t n)
 {
     int nobjs = 20;
-    char * chunk = chunk_alloc(n, nobjs);
+    char * chunk = chunk_alloc(n, nobjs);   // nobjs传入的是引用
     obj * __VOLATILE * my_free_list;
     obj * result;
     obj * current_obj, * next_obj;
@@ -529,10 +507,10 @@ void* __default_alloc_template<threads, inst>::refill(size_t n)
         current_obj = next_obj;
         next_obj = (obj *)((char *)next_obj + n);
         if (nobjs - 1 == i) {
-            current_obj -> free_list_link = 0;
+            current_obj -> next = 0;
             break;
         } else {
-            current_obj -> free_list_link = next_obj;
+            current_obj -> next = next_obj;
         }
       }
     return(result);
@@ -652,6 +630,8 @@ __default_alloc_template<threads, inst>::__unlock(volatile unsigned long *lock)
 }
 #endif
 
+// 直接在头文件中定义变量, 难到不会重定义吗?
+// 怎样确保在全局中该定义语句只会被编译一次?
 template <bool threads, int inst>
 char *__default_alloc_template<threads, inst>::start_free = 0;
 

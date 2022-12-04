@@ -43,7 +43,7 @@ void *p6 = __gnu_cxx::__pool_alloc<int>().allocate(9);
 __gnu_cxx::__pool_alloc().deallocate((int *)p6, 9);
 ```
 
-### 04 new and delete expression/keyword
+## 04 new and delete expression/keyword
 
 假设有两条语句``Complex *pc = new Complex(1, 2);`` 和 ``delete pc;``
 
@@ -647,7 +647,7 @@ class allocator
 private:
     struct linker { linker *next; };  // embedded pointer
     linker *freeStore = nullptr;      // head of freelist
-    int chunk = 5;                    // default block size
+    int chunk = 5;                    // default block size, 标准库使用的chunk是20
 public:
     void setChunk(int x) { chunk = x; }
     void *allocate(size_t size)
@@ -677,7 +677,7 @@ public:
 };
 ```
 
-其他程序想使用allocator的内存管理时, 直接在其类中引入一个allocator静态对象即可, 然后将其new和delete操作全部交给allocator处理即可. 就像下面这样.
+其他程序想使用allocator的内存管理时, 直接在其类中引入一个allocator静态对象即可, 然后将其new和delete操作全部交给allocator处理. 就像下面这样.
 
 ```c++
 #include "static_allocator.h"
@@ -688,30 +688,146 @@ private:
     int x, y;   // 值得注意的是, 对象占用的空间必须比next指针大;
                 // 在64位环境下执行, 指针占用8个字节, int只占用4个字节, 所以如果只有一个变量x, 则出错
 public:
-    static allocator alloc;
     static void *operator new(size_t size) 
     { return alloc.allocate(size); }
     static void operator delete(void *block, size_t size) 
     { return alloc.deallocate(block, size); }
+protected:
+    static allocator alloc;
 };
 
 // initialize static member data
 allocator Foo::alloc;
 ```
 
-如下是测试程序
+## 15 macro for static allocator
+
+上述类Foo对于allocator的使用, 只有在初始化静态成员变量时, 才会和类名有关. 为了更简化使用, 我们设计两个宏, 如下.
 
 ```c++
+// DECLARE_POOL_ALLOC, used in calss definition
+#define DECLARE_POOL_ALLOC \
+public:	\
+  static void *operator new(size_t size) { return myAlloc.allocate(size); } 	\
+  static void operator delete(void *block, size_t size) { return myAlloc.deallocate(block, size); } \
+protected: \
+  static allocator myAlloc;
+
+// IMPLEMENT_POOL_ALLOC, used in class implementation file
+#define IMPLEMENT_POOL_ALLOC(class_name) \
+allocator class_name::myAlloc
+```
+
+## 16 new handler
+
+当new没有内存可返回时, 其会抛出std::bad_alloc异常
+
+如果你使用`new (nothrow) Foo`, 则一定不会抛出异常, 如果没有内存返回空指针.
+
+标准库对于new的实现中, 其抛出异常之前, 会不止一次调用可以由用户指定的handler, 如下是handler的形式和设定方法. 其中set_new_handler是C++标准规定的方法, 包含在头文件`<new>`中
+
+```c++
+typedef void (*new_handler)();
+new_handler set_new_handler(new_handler p) throw();
+```
+
+使用set_new_handler
+
+```c++
+void noMoreMemory()
+{
+    cerr << "no more memory, abort()" << endl;
+    // abort();		// 如果此处不终止程序, 则会一直输出no more memory
+}
 int main()
 {
-    int N = 12;
-    Foo *p[N];
-    Foo::alloc.setChunk(10);
-    for(int i = 0; i < N; i++)  
-    {
-        p[i] = new Foo;
-        cout << p[i] << endl;   // 输出的前十个地址是连续的, 后续就不连续了
-    }
+    set_new_handler(noMoreMemory);
+    const long long maxn = 1e10 + 10;
+    int *p = new int [maxn]; 
 }
 ```
 
+## 16 =deault and =delete
+
+据说, 这两个关键字不仅可以用于拷贝控制函数, 还可以使用于operator new/new[] 和 operator delete/delete[] 和 他们的重载版本.
+
+经过测试, 发现实际上不行. 因为你无法说一个默认的new应该执行什么操作.
+
+事实上, 当你写出如下代码时, VSCode的C/C++扩展提示: "*'= default' can only appear on default constructors, copy/move constructors, copy/move assignment operators, and destructors C/C++(1774)*"
+
+```
+void *operator new(size_t size) = default; // g++: cannot be defaulted
+void operator delete[](void *block) = delete; // g++: use of deleted function
+```
+
+# 第二讲 std::allocator
+
+## 17 malloc() of VC6
+
+VC6中的malloc的内存布局, 从上到下, 依次是`cookie, debug header, block, debug tail, pad, cookie`
+
+cookie中存储的是这整块内存的大小 (好像还要加上1)
+
+malloc返回的指着指向block的起始, 传给free的指针也是block的起始. free会找到整个内存块并释放, 而不是只释放block
+
+## 18 19 20 std::allocator of VC6 / BC5 / G2.91 / G4.9.2
+
+四者的``std::allocator``只是以操作符``new``和``delete``完成``allocate()``和``deallocate()``，没有任何特殊设计。
+
+```cpp
+// VC98/CRT/SRC/XMEMORY and VC98/INCLUDE/XMEMORY
+// std::allocator of VC6
+template<class _Ty>
+class allocator 
+{
+public:
+	pointer allocate(size_type _N, const void *)
+		{return (_Allocate((difference_type)_N, (pointer)0)); }
+	
+	void deallocate(void _FARQ *_P, size_type)
+		{operator delete(_P); }
+};
+// _Allocate()
+template<class _Ty> inline
+_Ty _FARQ *_Allocate(_PDFT _N, _Ty _FARQ *)
+{
+    if (_N < 0) _N = 0;
+	return ((_Ty _FARQ *)operator new((_SIZT)_N * sizeof (_Ty)));
+}
+```
+
+为什么要设计别样的allocator呢? 当你所需要的内存块有大有小时, 别样的allocator是没作用的, 因为不同大小的内存块需要cookie来记录大小. 但是, 容器中的元素大小是固定的, 那么就没必要为每个元素存cookie. 比如一个`list`, 其每个元素的大小都是一样的, 如果使用默认的new分配节点, 则每个节点都需要存cookie, 浪费至极. 
+
+## 21 22 std::alloc of G2.91 == \_\_gnu_cxx::__pool_alloc of G4.9.2
+
+## 23 std::alloc of G2.91
+
+其预先开free_list[16], 其中free_list[0]挂接8字节的块, free_list[1]挂接16字节的块, 依次类推.
+
+一个链默认开多大呢 (CHUNK的默认大小)? 其设置的是20, 不知道依据
+
+## 27 implementation of std::alloc
+
+当静态成员变量为`const`时, 可以执行类内静态成员变量初始化
+
+```cpp
+class Foo
+{
+	static int x = 5;	// error: a member with an in-class initializer must be const
+    static const int y = 10;	// ok
+}
+```
+
+refill函数中递归调用自己真的是太神了
+
+在此之前, 我只有写搜索, 二叉树遍历等显然的递归过程才会写递归调用.
+
+万万没想到递归函数还可以这样应用: 如果有则返回, 如果没有则分配然后递归调用自己!
+
+
+
+当使用常量比较时, 比如`if(p == nullptr)`, 最好写成`if(nullptr == p)`, 后者能防止把等于号写成赋值号
+
+
+
+看完整个源码, 感觉`std::alloc`可以自己尝试写一下!! 但是线程安全问题怎么解决?
